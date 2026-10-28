@@ -507,12 +507,15 @@ impl Queues {
                 }
                 let constraint = JobConstraint::new(job.clone(), system.clone(), SmallVec::new());
                 match processor(constraint).await {
-                    Ok(crate::state::RealiseStepResult::Valid(m)) => {
+                    Ok(crate::state::RealiseStepResult::Valid(m, machine_dispatch)) => {
                         let wait_seconds = now.duration_since(job.runnable_since).as_secs_f64();
                         metrics.observe_job_wait_time(wait_seconds, &system);
 
                         self.add_job_to_scheduled(&job, &queue, m, dispatch_claim)
                             .await;
+                        // Retirement may snapshot this machine's jobs only
+                        // once the scheduled item can finalize those jobs.
+                        drop(machine_dispatch);
                     }
                     Ok(crate::state::RealiseStepResult::None) => {
                         tracing::debug!(
@@ -633,6 +636,103 @@ impl Queues {
 mod tests {
     use super::*;
     use crate::state::System;
+
+    #[tokio::test]
+    async fn retirement_waits_for_dispatch_to_publish_scheduled_job() {
+        use crate::config::{MachineFreeFn, MachineSortFn};
+        use crate::state::{Machine, Machines, RealiseStepResult, Step, machine::Job};
+
+        let machines = Machines::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let join = hydra_proto::JoinMessage {
+            machine_id: uuid::Uuid::new_v4().to_string(),
+            systems: vec!["x86_64-linux".to_owned()],
+            max_jobs: 1,
+            ..Default::default()
+        };
+        let id = machines.insert_machine(
+            Machine::new(join.clone(), sender.clone(), false, &[]).expect("valid machine"),
+            MachineSortFn::default(),
+        );
+        let drv: StorePath = format!("{}-retirement.drv", "a".repeat(32))
+            .parse()
+            .expect("valid drv path");
+        let step = Step::new(drv.clone(), Arc::default());
+        let queues = Queues::new();
+        let metrics = crate::state::metrics::PromMetrics::new().expect("valid metrics");
+        queues
+            .insert_new_jobs(
+                "x86_64-linux",
+                vec![StepInfo::new(step.clone())],
+                &jiff::Timestamp::now(),
+                StepSortFn::WithRdeps,
+                &metrics,
+            )
+            .await;
+        let release_dispatch = tokio::sync::Notify::new();
+        let processing = queues.process(
+            async |constraint: JobConstraint| {
+                let (machine, _) = constraint
+                    .resolve(&machines, MachineFreeFn::Static)
+                    .expect("registered machine has capacity");
+                let claim = machine.claim_dispatch().await.expect("active registration");
+                // Pause where real dispatch awaits derivation/DB IO after
+                // selecting the machine, before the job is attached.
+                release_dispatch.notified().await;
+                machine
+                    .build_drv(
+                        Job::new(1, drv.clone()),
+                        drv.clone(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                        Default::default(),
+                    )
+                    .await
+                    .expect("old tunnel still accepts the build");
+                Ok(RealiseStepResult::Valid(machine, claim))
+            },
+            |_| true,
+            &metrics,
+        );
+        tokio::pin!(processing);
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+
+        let old = machines
+            .remove_machine(id)
+            .expect("retire old registration");
+        assert!(old.jobs.read().is_empty());
+        // Block publication independently of the send, proving that the
+        // machine claim survives through insertion into `scheduled`.
+        let queue_lock = queues.inner.write().await;
+        let retirement = old.retire();
+        tokio::pin!(retirement);
+        assert!(futures::poll!(retirement.as_mut()).is_pending());
+        release_dispatch.notify_one();
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+        assert!(old.get_job(&drv).is_some(), "dispatch attached the job");
+        assert!(futures::poll!(retirement.as_mut()).is_pending());
+
+        drop(queue_lock);
+        assert_eq!(processing.await, 0);
+        retirement.await;
+        let item = queues.peek_scheduled(&drv).await.expect("job is scheduled");
+        assert_eq!(item.machine.session, old.session);
+        assert!(
+            old.get_job(&drv).is_some(),
+            "retirement can finalize the job"
+        );
+        assert!(old.claim_dispatch().await.is_none(), "stale Arc is retired");
+        machines.insert_machine(
+            Machine::new(join, sender, false, &[]).expect("valid reconnect"),
+            MachineSortFn::default(),
+        );
+        let current = machines.get_machine_by_id(id).expect("new registration");
+        assert_ne!(current.session, old.session);
+        assert!(current.claim_dispatch().await.is_some());
+    }
 
     #[tokio::test]
     async fn test_ensure_queues_for_systems() {

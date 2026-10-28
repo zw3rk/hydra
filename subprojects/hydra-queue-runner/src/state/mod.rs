@@ -279,7 +279,7 @@ enum RealiseStepResult {
     None,
     /// Created a new resolved `BuildStep`
     Resolved,
-    Valid(Arc<Machine>),
+    Valid(Arc<Machine>, machine::DispatchGuard),
     MaybeCancelled,
     CachedFailure,
 }
@@ -618,6 +618,10 @@ impl State {
     /// Fail (as Aborted, so they retry) the steps of a machine that is no
     /// longer registered.
     async fn retire_machine(&self, m: Arc<Machine>) {
+        // A dispatcher can retain this machine across input/DB IO after it
+        // leaves the registry. Wait until its job and scheduled item are both
+        // attached before taking the snapshot, and reject later dispatches.
+        m.retire().await;
         let machine_id = m.id;
         let jobs = {
             let jobs = m.jobs.read();
@@ -885,6 +889,9 @@ impl State {
         let free_fn = self.config.get_machine_free_fn();
 
         let Some((machine, step_info)) = constraint.resolve(&self.machines, free_fn) else {
+            return Ok(RealiseStepResult::None);
+        };
+        let Some(machine_dispatch) = machine.claim_dispatch().await else {
             return Ok(RealiseStepResult::None);
         };
         let drv = step_info.step.get_drv_path();
@@ -1236,7 +1243,7 @@ impl State {
         }
         self.metrics.nr_steps_started.inc();
         self.metrics.nr_steps_building.add(1);
-        Ok(RealiseStepResult::Valid(machine))
+        Ok(RealiseStepResult::Valid(machine, machine_dispatch))
     }
 
     #[tracing::instrument(skip(self), fields(%drv))]

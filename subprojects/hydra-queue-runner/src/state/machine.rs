@@ -19,6 +19,9 @@ pub enum MachineError {
     #[error("failed to send message to machine: channel closed")]
     Channel(#[from] mpsc::error::SendError<Message>),
 
+    #[error("machine registration retired before dispatch")]
+    Retired,
+
     #[error("parsing machine UUID")]
     Uuid(#[from] uuid::Error),
 }
@@ -594,6 +597,13 @@ impl Message {
     }
 }
 
+/// Keeps retirement from taking its job snapshot until an accepted dispatch
+/// has both attached its job and published its scheduled item.
+#[derive(Debug)]
+pub(super) struct DispatchGuard {
+    _active: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Machine {
     pub id: uuid::Uuid,
@@ -627,6 +637,10 @@ pub struct Machine {
     pub nix_version: String,
     pub joined_at: jiff::Timestamp,
 
+    // A writer retires this registration after all accepted dispatches finish.
+    // Stale machine Arcs must then reject new dispatches.
+    dispatch_active: Arc<tokio::sync::RwLock<()>>,
+    retiring: tokio_util::sync::CancellationToken,
     msg_queue: mpsc::Sender<Message>,
     pub stats: Arc<Stats>,
     pub jobs: Arc<parking_lot::RwLock<Vec<Job>>>,
@@ -705,12 +719,42 @@ impl Machine {
             use_substitutes: msg.use_substitutes,
             nix_version: msg.nix_version,
 
+            dispatch_active: Arc::new(tokio::sync::RwLock::new(())),
+            retiring: tokio_util::sync::CancellationToken::new(),
             msg_queue: tx,
             joined_at: jiff::Timestamp::now(),
             stats: Arc::new(Stats::new()),
             jobs: Arc::new(parking_lot::RwLock::new(Vec::new())),
             freed_jobs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
+    }
+
+    pub(super) async fn claim_dispatch(&self) -> Option<DispatchGuard> {
+        let active = self.dispatch_active.clone().read_owned().await;
+        if self.retiring.is_cancelled() {
+            return None;
+        }
+        Some(DispatchGuard { _active: active })
+    }
+
+    pub(super) async fn retire(&self) {
+        // A tunnel can run retirement from its receive loop. Unblock any send
+        // waiting on that loop before waiting for the dispatch guard.
+        self.retiring.cancel();
+        // Do not keep the writer while failing jobs: result processing needs
+        // queue locks that an accepted dispatcher may also have used.
+        drop(self.dispatch_active.write().await);
+    }
+
+    async fn send_message(&self, message: Message) -> Result<(), MachineError> {
+        tokio::select! {
+            // A ready send can finish. For builds, retirement waits for the
+            // dispatch guard and scheduled item before taking its snapshot.
+            biased;
+            result = self.msg_queue.send(message) => result?,
+            () = self.retiring.cancelled() => return Err(MachineError::Retired),
+        }
+        Ok(())
     }
 
     #[tracing::instrument(
@@ -734,18 +778,17 @@ impl Machine {
         resolved_drv: hydra_proto::nix::store::derivation::v1::Basic,
     ) -> Result<(), MachineError> {
         let drv = effective_drv;
-        self.msg_queue
-            .send(Message::BuildMessage {
-                build_id: job.internal_build_id,
-                drv,
-                max_log_size,
-                max_output_size,
-                max_silent_time,
-                build_timeout,
-                presigned_url_opts,
-                resolved_drv: Box::new(resolved_drv),
-            })
-            .await?;
+        self.send_message(Message::BuildMessage {
+            build_id: job.internal_build_id,
+            drv,
+            max_log_size,
+            max_output_size,
+            max_silent_time,
+            build_timeout,
+            presigned_url_opts,
+            resolved_drv: Box::new(resolved_drv),
+        })
+        .await?;
 
         if self.stats.jobs_in_last_30s_count.load(Ordering::Relaxed) == 0 {
             self.stats
@@ -763,8 +806,7 @@ impl Machine {
 
     #[tracing::instrument(skip(self), fields(build_id=%build_id), err)]
     pub async fn abort_build(&self, build_id: uuid::Uuid) -> Result<(), MachineError> {
-        self.msg_queue
-            .send(Message::AbortMessage { build_id })
+        self.send_message(Message::AbortMessage { build_id })
             .await?;
 
         // dont remove job from machine now, we will do that when the job is set to failed/cancelled
@@ -773,7 +815,7 @@ impl Machine {
 
     #[tracing::instrument(skip(self), err)]
     pub async fn publish_config_update(&self, change: ConfigUpdate) -> Result<(), MachineError> {
-        self.msg_queue.send(Message::ConfigUpdate(change)).await?;
+        self.send_message(Message::ConfigUpdate(change)).await?;
         Ok(())
     }
 
@@ -1098,6 +1140,8 @@ mod tests {
             use_substitutes: false,
             nix_version: String::new(),
             joined_at: jiff::Timestamp::now(),
+            dispatch_active: Arc::new(tokio::sync::RwLock::new(())),
+            retiring: tokio_util::sync::CancellationToken::new(),
             msg_queue: tx,
             stats: Arc::new(stats),
             jobs: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -1134,6 +1178,8 @@ mod tests {
     fn reconnected(m: &Machine) -> Machine {
         let mut n = m.clone();
         n.session = uuid::Uuid::new_v4();
+        n.dispatch_active = Arc::new(tokio::sync::RwLock::new(()));
+        n.retiring = tokio_util::sync::CancellationToken::new();
         n
     }
 
@@ -1141,6 +1187,45 @@ mod tests {
         let mut m = (*machine("mac", 4, 0)).clone();
         m.systems = SmallVec::from_vec(vec!["x86_64-linux".to_owned()]);
         m
+    }
+
+    #[tokio::test]
+    async fn retirement_unblocks_dispatch_waiting_on_full_tunnel() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut old = linux_machine();
+        old.msg_queue = sender.clone();
+        sender
+            .send(Message::AbortMessage {
+                build_id: uuid::Uuid::new_v4(),
+            })
+            .await
+            .expect("fill tunnel channel");
+        let claim = old.claim_dispatch().await.expect("active registration");
+        let drv = format!("{}-retirement.drv", "b".repeat(32))
+            .parse::<StorePath>()
+            .expect("valid drv path");
+        let dispatch = old.build_drv(
+            Job::new(1, drv.clone()),
+            drv,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Default::default(),
+        );
+        tokio::pin!(dispatch);
+        assert!(futures::poll!(dispatch.as_mut()).is_pending());
+        let retirement = old.retire();
+        tokio::pin!(retirement);
+        assert!(futures::poll!(retirement.as_mut()).is_pending());
+        assert!(matches!(
+            futures::poll!(dispatch.as_mut()),
+            std::task::Poll::Ready(Err(MachineError::Retired))
+        ));
+        assert!(old.jobs.read().is_empty());
+        drop(claim);
+        assert!(futures::poll!(retirement.as_mut()).is_ready());
     }
 
     #[test]

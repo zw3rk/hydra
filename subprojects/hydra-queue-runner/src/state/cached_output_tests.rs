@@ -484,7 +484,10 @@ async fn schedule_one_runnable_step(state: &State, drv: &StorePath) {
     let process = state
         .queues
         .process(
-            async move |_constraint| Ok(RealiseStepResult::Valid(machine.clone())),
+            async move |_constraint| {
+                let claim = machine.claim_dispatch().await.expect("active registration");
+                Ok(RealiseStepResult::Valid(machine.clone(), claim))
+            },
             |_| true,
             &state.metrics,
         )
@@ -848,9 +851,10 @@ async fn dispatch_in_progress_defers_cached_output_recheck() {
     let processor_release = release_claim.clone();
     let processing = state.queues.process(
         async move |_constraint| {
+            let claim = machine.claim_dispatch().await.expect("active registration");
             processor_entered.wait().await;
             processor_release.wait().await;
-            Ok(RealiseStepResult::Valid(machine.clone()))
+            Ok(RealiseStepResult::Valid(machine.clone(), claim))
         },
         |_| true,
         &state.metrics,
