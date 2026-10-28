@@ -1212,7 +1212,7 @@ mod tests {
             0,
             0,
             None,
-            Default::default(),
+            hydra_proto::nix::store::derivation::v1::Basic::default(),
         );
         tokio::pin!(dispatch);
         assert!(futures::poll!(dispatch.as_mut()).is_pending());

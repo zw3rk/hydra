@@ -688,7 +688,7 @@ mod tests {
                         0,
                         0,
                         None,
-                        Default::default(),
+                        hydra_proto::nix::store::derivation::v1::Basic::default(),
                     )
                     .await
                     .expect("old tunnel still accepts the build");
