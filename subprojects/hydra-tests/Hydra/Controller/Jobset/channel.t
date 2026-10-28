@@ -6,7 +6,6 @@ use IO::Uncompress::Bunzip2 qw(bunzip2);
 use Archive::Tar;
 use JSON::MaybeXS qw(decode_json);
 use Data::Dumper;
-use Hydra::Helper::Exec;
 my %ctx = test_init(
   use_external_destination_store => 0
 );
@@ -45,7 +44,8 @@ $tar->extract_file("channel/default.nix", $defaultnix);
 
 print STDERR $tar->get_content("channel/default.nix");
 
-(my $status, my $stdout, my $stderr) = captureStdoutStderr(5, "nix-env", "--json", "--query", "--available", "--attr-path", "--file", $defaultnix);
+# Query with the same private store and configuration used to build the channel.
+(my $status, my $stdout, my $stderr) = $ctx{context}->capture_cmd(5, "nix-env", "--json", "--query", "--available", "--attr-path", "--file", $defaultnix);
 is($stderr, "", "Stderr should be empty");
 is($status, 0, "Querying the packages should succeed");
 
